@@ -65,6 +65,36 @@ class TestVerifiedSnapshot:
 
 @pytest.mark.unit
 class TestTool:
+    def test_missing_close_is_reported_to_graph_without_crashing(self, monkeypatch):
+        from langchain_core.messages import AIMessage
+        from langgraph.graph import END, START, MessagesState, StateGraph
+        from langgraph.prebuilt import ToolNode
+
+        from tradingagents.agents.utils.market_data_validation_tools import (
+            get_verified_market_snapshot,
+        )
+        from tradingagents.dataflows.symbol_utils import NoMarketDataError
+
+        def unavailable(*args):
+            raise NoMarketDataError("COHR", "COHR", "latest bar has no closing price")
+
+        monkeypatch.setattr(validator, "load_ohlcv", unavailable)
+        graph = StateGraph(MessagesState)
+        graph.add_node("tools", ToolNode([get_verified_market_snapshot]))
+        graph.add_edge(START, "tools")
+        graph.add_edge("tools", END)
+        result = graph.compile().invoke({"messages": [
+            AIMessage(content="", tool_calls=[{
+                "name": "get_verified_market_snapshot",
+                "args": {"symbol": "COHR", "curr_date": "2026-09-03"},
+                "id": "snapshot-1", "type": "tool_call",
+            }]),
+        ]})
+        content = result["messages"][-1].content
+        assert "NO_DATA_AVAILABLE" in content
+        assert "no closing price" in content
+        assert "Do not estimate or fabricate" in content
+
     def test_tool_delegates_to_builder(self, monkeypatch):
         from tradingagents.agents.utils.market_data_validation_tools import (
             get_verified_market_snapshot,

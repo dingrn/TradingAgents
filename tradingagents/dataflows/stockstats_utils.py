@@ -181,6 +181,12 @@ def _needs_same_day_refresh(data_file, curr_date_dt, today_date) -> bool:
     return time.time() - os.path.getmtime(data_file) > OHLCV_CACHE_TTL_SECONDS
 
 
+def _in_range_ohlcv(data: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Normalize and order bars before inspecting the latest requested session."""
+    data = _clean_dataframe(data)
+    return data[data["Date"] <= cutoff].sort_values("Date")
+
+
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -216,6 +222,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     # transient rate limit). Treat an empty/columnless cache as a miss and
     # re-fetch rather than serving the poisoned file forever.
     data = None
+    downloaded = None
     if os.path.exists(data_file):
         cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
         # Serve the cache only when it is usable and not a stale snapshot of the
@@ -225,7 +232,11 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             and "Close" in cached.columns
             and not _needs_same_day_refresh(data_file, curr_date_dt, today_date)
         ):
-            data = cached
+            candidate = _in_range_ohlcv(cached, curr_date_dt)
+            # An incomplete cache is not immutable historical data. Refetch
+            # once even within the TTL; never substitute the previous close.
+            if not candidate.empty and pd.notna(candidate["Close"].iloc[-1]):
+                data = candidate
 
     if data is None:
         downloaded = yf_retry(lambda: yf.download(
@@ -242,13 +253,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             raise NoMarketDataError(
                 symbol, canonical, "Yahoo Finance returned no rows"
             )
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
-        data = downloaded
-
-    data = _clean_dataframe(data)
-
-    # Filter to curr_date to prevent look-ahead bias in backtesting.
-    data = data[data["Date"] <= curr_date_dt]
+        data = _in_range_ohlcv(downloaded.copy(), curr_date_dt)
 
     # Guard the latest in-range bar before dropping incomplete rows: a newest bar
     # with no close is "not settled yet", not "does not exist". Silently dropping
@@ -256,14 +261,23 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     # instead so the router surfaces it rather than fabricating a fallback.
     if not data.empty and pd.isna(data["Close"].iloc[-1]):
         raise NoMarketDataError(
-            symbol, canonical, "latest in-range OHLCV bar has no closing price"
+            symbol, canonical,
+            f"latest in-range OHLCV bar has no closing price "
+            f"({data['Date'].iloc[-1].date()}; requested {curr_date})"
         )
+
+    if data.empty:
+        raise NoMarketDataError(symbol, canonical, f"no OHLCV rows on or before {curr_date}")
 
     data = _fill_price_gaps(data)
 
     # Reject a stale frame (latest row far older than curr_date) rather than
     # feeding year-old prices into indicators (#1021).
     _assert_ohlcv_not_stale(data, curr_date, symbol, canonical)
+
+    # Persist a download only after it passes the requested-date checks.
+    if downloaded is not None:
+        downloaded.to_csv(data_file, index=False, encoding="utf-8")
 
     return data
 

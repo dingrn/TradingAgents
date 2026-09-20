@@ -80,7 +80,7 @@ def test_fill_price_gaps_drops_nan_close_rows():
 
 # --- load_ohlcv end-to-end (with a mocked cache read) -----------------------
 
-def _run_load(monkeypatch, tmp_path, frame, curr_date):
+def _run_load(monkeypatch, tmp_path, frame, curr_date, refreshed=None):
     """Drive load_ohlcv against a pre-seeded cache frame (no network)."""
     monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
     today = pd.Timestamp(curr_date)
@@ -90,6 +90,8 @@ def _run_load(monkeypatch, tmp_path, frame, curr_date):
     (tmp_path / f"AAPL-YFin-data-{start}-{end}.csv").write_text(frame.to_csv(index=False))
 
     def _fail_download(*a, **k):
+        if refreshed is not None:
+            return refreshed.set_index("Date")
         raise AssertionError("should use the seeded cache, not download")
     monkeypatch.setattr(su.yf, "download", _fail_download)
     monkeypatch.setattr(su, "_assert_ohlcv_not_stale", lambda *a, **k: None)
@@ -105,7 +107,38 @@ def test_latest_in_range_nan_close_raises_not_silent_fallback(monkeypatch, tmp_p
         "Close": [100.5, float("nan")], "Volume": [1_000_000, 1_000_000],
     })
     with pytest.raises(NoMarketDataError, match="no closing price"):
-        _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
+        _run_load(monkeypatch, tmp_path, frame, "2026-05-08", refreshed=frame)
+
+
+@pytest.mark.unit
+def test_incomplete_cache_refetches_and_persists_recovered_close(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Date": ["2026-05-07", "2026-05-08"],
+                          "Close": [100.5, float("nan")]})
+    refreshed = frame.copy()
+    refreshed.loc[1, "Close"] = 102.5
+    out = _run_load(monkeypatch, tmp_path, frame, "2026-05-08", refreshed=refreshed)
+    assert out["Close"].iloc[-1] == 102.5
+    assert pd.read_csv(next(tmp_path.glob("*.csv")))["Close"].iloc[-1] == 102.5
+
+
+@pytest.mark.unit
+def test_missing_future_close_does_not_invalidate_historical_cache(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Date": ["2026-05-08", "2026-05-09"],
+                          "Close": [100.5, float("nan")]})
+    out = _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
+    assert out["Date"].iloc[-1] == pd.Timestamp("2026-05-08")
+    assert out["Close"].iloc[-1] == 100.5
+
+
+@pytest.mark.unit
+def test_incomplete_download_is_not_cached(monkeypatch, tmp_path):
+    monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    frame = pd.DataFrame({"Date": pd.to_datetime(["2026-05-07", "2026-05-08"]),
+                          "Close": [100.5, float("nan")]})
+    monkeypatch.setattr(su.yf, "download", lambda *a, **k: frame.set_index("Date"))
+    with pytest.raises(NoMarketDataError, match="2026-05-08"):
+        su.load_ohlcv("COHR", "2026-05-08")
+    assert not list(tmp_path.glob("*.csv"))
 
 
 @pytest.mark.unit
