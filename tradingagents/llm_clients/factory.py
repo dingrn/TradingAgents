@@ -1,5 +1,41 @@
 
+from collections.abc import Mapping
+from typing import Any
+
 from .base_client import BaseLLMClient
+from .routing import LLMRoutingResolution, RoutingResolutionError
+
+
+def resolve_llm_routing(
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    **kwargs: Any,
+) -> LLMRoutingResolution:
+    """Resolve effective non-secret routing while retaining lazy SDK imports."""
+    provider_lower = provider.lower()
+    if provider_lower == "azure":
+        from .azure_client import resolve_azure_routing
+
+        return resolve_azure_routing(
+            model, base_url, environment=environment, **kwargs
+        )
+
+    from .openai_client import is_openai_compatible, resolve_openai_routing
+
+    if is_openai_compatible(provider_lower):
+        return resolve_openai_routing(
+            provider_lower,
+            model,
+            base_url,
+            environment=environment,
+            **kwargs,
+        )
+    raise RoutingResolutionError(
+        f"Routing resolution is not implemented for LLM provider: {provider}"
+    )
 
 
 def create_llm_client(

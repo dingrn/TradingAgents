@@ -8,7 +8,11 @@ model name is accepted, and the env backend URL precedence (#978).
 import pytest
 
 from tradingagents.llm_clients.api_key_env import get_api_key_env
-from tradingagents.llm_clients.factory import create_llm_client
+from tradingagents.llm_clients.factory import create_llm_client, resolve_llm_routing
+from tradingagents.llm_clients.routing import (
+    RoutingResolutionError,
+    UnsupportedRoutingSelectorError,
+)
 from tradingagents.llm_clients.validators import validate_model
 
 # Note: assert by class NAME, not isinstance — other tests reload the
@@ -72,6 +76,96 @@ def test_env_backend_url_precedence():
     assert resolve_backend_url("openai", "https://api.openai.com/v1", env_url="http://proxy/v1") == "http://proxy/v1"
     assert resolve_backend_url("openai", "https://api.openai.com/v1", env_url=None) == "https://api.openai.com/v1"
     assert resolve_backend_url("deepseek", None, None) == "https://api.deepseek.com"
+
+
+@pytest.mark.unit
+def test_routing_resolution_uses_explicit_environment_without_mutating_process(monkeypatch):
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ambient.invalid/v1")
+    environment = {
+        "OLLAMA_BASE_URL": "http://selected.example/v1",
+        "OPENAI_API_KEY": "must-not-leak",
+    }
+
+    resolved = resolve_llm_routing(
+        "ollama", "qwen3:30b", environment=environment
+    )
+
+    assert resolved.endpoint.value == "http://selected.example/v1"
+    assert resolved.endpoint.source == "environment"
+    assert resolved.endpoint.environment_variable == "OLLAMA_BASE_URL"
+    assert resolved.protocol.value == "chat_completions"
+    assert resolved.credential.present is False
+    assert resolved.routing_environment_variables == ("OLLAMA_BASE_URL",)
+    assert "must-not-leak" not in repr(resolved)
+    assert __import__("os").environ["OLLAMA_BASE_URL"] == "http://ambient.invalid/v1"
+
+
+@pytest.mark.unit
+def test_native_openai_resolves_sdk_environment_and_credential_source():
+    environment = {
+        "OPENAI_BASE_URL": "https://gateway.example/v1",
+        "OPENAI_API_KEY": "secret-value",
+    }
+
+    resolved = resolve_llm_routing("openai", "gpt-5", environment=environment)
+
+    assert resolved.endpoint.value == "https://gateway.example/v1"
+    assert resolved.endpoint.source == "sdk_environment"
+    assert resolved.protocol.value == "responses"
+    assert resolved.credential.present is True
+    assert resolved.credential.source == "environment"
+    assert resolved.credential.environment_variable == "OPENAI_API_KEY"
+    assert "secret-value" not in repr(resolved)
+
+
+@pytest.mark.unit
+def test_explicit_base_url_and_key_take_precedence_without_exposing_key():
+    resolved = resolve_llm_routing(
+        "openai",
+        "gpt-5",
+        "https://explicit.example/v1",
+        environment={
+            "OPENAI_BASE_URL": "https://ambient.example/v1",
+            "OPENAI_API_KEY": "ambient-secret",
+        },
+        api_key="explicit-secret",
+    )
+
+    assert resolved.endpoint.value == "https://explicit.example/v1"
+    assert resolved.endpoint.source == "explicit"
+    assert resolved.protocol.value == "chat_completions"
+    assert resolved.credential.source == "explicit"
+    assert "explicit-secret" not in repr(resolved)
+    assert "ambient-secret" not in repr(resolved)
+
+
+@pytest.mark.unit
+def test_unsupported_openai_sdk_selector_fails_explicitly():
+    with pytest.raises(UnsupportedRoutingSelectorError, match="use_responses_api"):
+        resolve_llm_routing(
+            "openai",
+            "gpt-5",
+            environment={"OPENAI_API_KEY": "secret"},
+            use_responses_api=False,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://user:password@gateway.example/v1",
+        "https://gateway.example/v1?api-key=secret-value",
+    ],
+)
+def test_credential_bearing_endpoint_is_not_returned(endpoint):
+    with pytest.raises(RoutingResolutionError, match="credential-bearing") as exc_info:
+        resolve_llm_routing(
+            "openai", "gpt-5", endpoint, environment={"OPENAI_API_KEY": "secret"}
+        )
+
+    assert "password" not in str(exc_info.value)
+    assert "secret-value" not in str(exc_info.value)
 
 
 @pytest.mark.unit

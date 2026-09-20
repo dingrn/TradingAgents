@@ -1,5 +1,6 @@
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -10,6 +11,14 @@ from langchain_openai import ChatOpenAI
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
+from .routing import (
+    CredentialPresence,
+    LLMRoutingResolution,
+    ResolvedRoutingValue,
+    RoutingResolutionError,
+    UnsupportedRoutingSelectorError,
+    ensure_non_secret_endpoint,
+)
 from .validators import validate_model
 
 
@@ -255,6 +264,142 @@ def _is_native_openai_base_url(base_url: str | None) -> bool:
     return host == "api.openai.com" or host.endswith(".openai.com")
 
 
+_OPENAI_SDK_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+_UNSUPPORTED_ROUTING_KWARGS = frozenset(
+    {
+        "api_version",
+        "azure_deployment",
+        "azure_endpoint",
+        "deployment_name",
+        "openai_api_base",
+        "use_responses_api",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _OpenAISettings:
+    routing: LLMRoutingResolution
+    api_key: str | None
+    client_base_url: str | None
+    chat_class: type
+
+
+def _resolve_openai_settings(
+    provider: str,
+    model: str,
+    base_url: str | None,
+    environment: Mapping[str, str],
+    kwargs: Mapping[str, Any],
+) -> _OpenAISettings:
+    provider = provider.lower()
+    spec = OPENAI_COMPATIBLE_PROVIDERS.get(provider)
+    if spec is None:
+        raise RoutingResolutionError(f"Unsupported OpenAI-compatible provider: {provider}")
+
+    unsupported = sorted(_UNSUPPORTED_ROUTING_KWARGS.intersection(kwargs))
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise UnsupportedRoutingSelectorError(
+            f"Provider '{provider}' routing cannot resolve unsupported selector(s): {names}"
+        )
+
+    provider_environment_url = environment.get(spec.base_url_env) if spec.base_url_env else None
+    registry_base_url: str | None
+    if base_url:
+        registry_base_url = base_url
+        endpoint = ResolvedRoutingValue(base_url, "explicit")
+    elif provider_environment_url:
+        registry_base_url = provider_environment_url
+        endpoint = ResolvedRoutingValue(
+            provider_environment_url, "environment", spec.base_url_env
+        )
+    elif spec.base_url:
+        registry_base_url = spec.base_url
+        endpoint = ResolvedRoutingValue(spec.base_url, "provider_default")
+    elif provider == "openai" and environment.get("OPENAI_BASE_URL"):
+        registry_base_url = None
+        endpoint = ResolvedRoutingValue(
+            environment["OPENAI_BASE_URL"], "sdk_environment", "OPENAI_BASE_URL"
+        )
+    elif provider == "openai":
+        registry_base_url = None
+        endpoint = ResolvedRoutingValue(_OPENAI_SDK_DEFAULT_BASE_URL, "sdk_default")
+    else:
+        raise RoutingResolutionError(
+            f"Provider '{provider}' requires a base_url. Set it via backend_url / "
+            "TRADINGAGENTS_LLM_BACKEND_URL to your endpoint, e.g. "
+            "http://localhost:8000/v1 (vLLM) or http://localhost:1234/v1 (LM Studio)."
+        )
+    ensure_non_secret_endpoint(endpoint.value, "OpenAI-compatible endpoint")
+
+    # Preserve the existing protocol rule: the provider-owned URL selection
+    # controls whether native OpenAI uses Responses. OPENAI_BASE_URL remains an
+    # SDK-level endpoint override and does not silently rewrite that selection.
+    use_responses_api = spec.use_responses_api and _is_native_openai_base_url(
+        registry_base_url
+    )
+    protocol = ResolvedRoutingValue(
+        "responses" if use_responses_api else "chat_completions",
+        "provider_registry",
+    )
+
+    api_key_environment = get_api_key_env(provider)
+    explicit_api_key = kwargs.get("api_key")
+    environment_api_key = (
+        environment.get(api_key_environment) if api_key_environment else None
+    )
+    if explicit_api_key:
+        api_key = explicit_api_key
+        credential = CredentialPresence(True, "api_key", "explicit")
+    elif environment_api_key:
+        api_key = environment_api_key
+        credential = CredentialPresence(
+            True, "api_key", "environment", api_key_environment
+        )
+    elif spec.key_optional:
+        api_key = spec.placeholder_key
+        credential = CredentialPresence(
+            False, "api_key", "optional", api_key_environment
+        )
+    else:
+        api_key = None
+        credential = CredentialPresence(
+            False, "api_key", "missing", api_key_environment
+        )
+
+    routing_environment_variables = tuple(
+        name
+        for name in (spec.base_url_env, "OPENAI_BASE_URL" if provider == "openai" else None)
+        if name
+    )
+    routing = LLMRoutingResolution(
+        provider=provider,
+        model=model,
+        endpoint=endpoint,
+        protocol=protocol,
+        credential=credential,
+        routing_environment_variables=routing_environment_variables,
+    )
+    client_base_url = None if endpoint.source == "sdk_default" else endpoint.value
+    return _OpenAISettings(routing, api_key, client_base_url, spec.chat_class)
+
+
+def resolve_openai_routing(
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    **kwargs: Any,
+) -> LLMRoutingResolution:
+    """Resolve OpenAI-compatible routing without exposing credential values."""
+    selected_environment = os.environ if environment is None else environment
+    return _resolve_openai_settings(
+        provider, model, base_url, selected_environment, kwargs
+    ).routing
+
+
 class OpenAIClient(BaseLLMClient):
     """Client for OpenAI, Ollama, OpenRouter, and xAI providers.
 
@@ -278,60 +423,35 @@ class OpenAIClient(BaseLLMClient):
         """Return a configured ChatOpenAI instance, driven by the provider registry."""
         self.warn_if_unknown_model()
         llm_kwargs = {"model": self.model}
-        spec = OPENAI_COMPATIBLE_PROVIDERS.get(self.provider)
-        chat_cls = NormalizedChatOpenAI
-
-        if spec is not None:
-            chat_cls = spec.chat_class
-
-            # base_url precedence: explicit client base_url (carries the config /
-            # TRADINGAGENTS_LLM_BACKEND_URL value) > provider env override (e.g.
-            # OLLAMA_BASE_URL) > provider default. None means use the SDK default.
-            env_base_url = os.environ.get(spec.base_url_env) if spec.base_url_env else None
-            base_url = self.base_url or env_base_url or spec.base_url
-            if spec.require_base_url and not base_url:
-                raise ValueError(
-                    f"Provider '{self.provider}' requires a base_url. Set it via "
-                    "backend_url / TRADINGAGENTS_LLM_BACKEND_URL to your endpoint, "
-                    "e.g. http://localhost:8000/v1 (vLLM) or http://localhost:1234/v1 "
-                    "(LM Studio)."
-                )
-            if base_url:
-                llm_kwargs["base_url"] = base_url
-
-            # API key: required unless key_optional; keyless local servers get a
-            # placeholder. The env-var name is the single source in api_key_env.
-            api_key_env = get_api_key_env(self.provider)
-            api_key = os.environ.get(api_key_env) if api_key_env else None
-            if api_key:
-                llm_kwargs["api_key"] = api_key
-            elif spec.key_optional:
-                llm_kwargs["api_key"] = spec.placeholder_key
-            elif api_key_env:
-                raise ValueError(
-                    f"API key for provider '{self.provider}' is not set. "
-                    f"Please set the {api_key_env} environment variable "
-                    f"(e.g. add {api_key_env}=your_key to your .env file)."
-                )
-
-            # The Responses API only exists on native OpenAI; if the user points
-            # the openai provider at a custom base_url (proxy/gateway/local), it
-            # only speaks Chat Completions, so keep Responses off there (#1024).
-            if spec.use_responses_api and _is_native_openai_base_url(base_url):
-                llm_kwargs["use_responses_api"] = True
-        elif self.base_url:
-            llm_kwargs["base_url"] = self.base_url
+        settings = _resolve_openai_settings(
+            self.provider, self.model, self.base_url, os.environ, self.kwargs
+        )
+        if settings.client_base_url:
+            llm_kwargs["base_url"] = settings.client_base_url
+        if settings.api_key:
+            llm_kwargs["api_key"] = settings.api_key
+        elif settings.routing.credential.environment_variable:
+            api_key_environment = settings.routing.credential.environment_variable
+            raise ValueError(
+                f"API key for provider '{self.provider}' is not set. "
+                f"Please set the {api_key_environment} environment variable "
+                f"(e.g. add {api_key_environment}=your_key to your .env file)."
+            )
+        if settings.routing.protocol.value == "responses":
+            llm_kwargs["use_responses_api"] = True
 
         # Forward user-provided kwargs
         for key in _PASSTHROUGH_KWARGS:
             if key not in self.kwargs:
+                continue
+            if key == "api_key":
                 continue
             if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
                 continue
             llm_kwargs[key] = self.kwargs[key]
 
         # The subclass (provider quirks) comes from the registry spec.
-        return chat_cls(**llm_kwargs)
+        return settings.chat_class(**llm_kwargs)
 
     def validate_model(self) -> bool:
         """Validate model for the provider."""
