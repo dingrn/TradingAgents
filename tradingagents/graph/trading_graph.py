@@ -37,6 +37,18 @@ from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
+from .observation import (
+    ANALYSIS_COMPLETED,
+    CHECKPOINT_INITIALIZED,
+    IDENTITY_RESOLVED,
+    MEMORY_RESOLVED,
+    PREPARING,
+    REPORTS_SAVED,
+    GraphObservation,
+    GraphObservationHandler,
+    Observer,
+    emit,
+)
 from .propagation import Propagator
 from .reflection import Reflector
 from .setup import GraphSetup
@@ -93,12 +105,16 @@ def _coerce_max_tokens(value):
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
+    # Nothing is observed unless a caller asks for it.
+    observer: Observer | None = None
+
     def __init__(
         self,
         selected_analysts=("market", "social", "news", "fundamentals"),
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        observer: Observer | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -107,10 +123,18 @@ class TradingAgentsGraph:
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
+            observer: Optional callable receiving
+                :class:`~tradingagents.graph.observation.GraphObservation`
+                records for this run's progress. It is a separate concern from
+                ``callbacks``: those are bound to the LLM clients, while the
+                observation handler is forwarded through the graph invocation
+                config, so the two never report the same model response twice.
+                Its failures are logged and never end the run.
         """
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.observer = observer
 
         # Update the interface's config
         set_config(self.config)
@@ -178,6 +202,28 @@ class TradingAgentsGraph:
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
         self._resuming = False
+
+    def _observe(self, obs_type: str, **payload: Any) -> None:
+        """Report one outer-lifecycle step: work TA does around the graph."""
+        emit(self.observer, GraphObservation(type=obs_type, payload=payload))
+
+    def observation_callbacks(self) -> list | None:
+        """Graph-invocation callbacks that report node/tool progress.
+
+        ``None`` when no observer is configured, so the invocation arguments stay
+        exactly as they were. A caller that streams the graph itself (the CLI
+        path) passes the result to ``propagator.get_graph_args`` alongside its
+        own handlers.
+        """
+        if self.observer is None:
+            return None
+        return [
+            GraphObservationHandler(
+                self.observer,
+                max_debate_rounds=self.config["max_debate_rounds"],
+                max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
+            )
+        ]
 
     def _get_provider_kwargs(self) -> dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -448,6 +494,12 @@ class TradingAgentsGraph:
         when the decision had no parseable rating (#1170); guard with
         ``tradingagents.agents.utils.rating.is_review`` before mapping it to the
         PortfolioRating enum.
+
+        This stays the owner of the run's lifecycle. When the graph was built
+        with an ``observer``, it also reports that lifecycle as it goes —
+        preparation, memory and identity resolution, resume initialization, the
+        graph's own node/tool progress, and completion — without changing what
+        is executed or returned.
         """
         trade_date = _validate_trade_date(trade_date)
         self.ticker = company_name
@@ -471,6 +523,9 @@ class TradingAgentsGraph:
         """
         self._resuming = False
         if not self.config.get("checkpoint_enabled"):
+            self._observe(
+                CHECKPOINT_INITIALIZED, enabled=False, resuming=False, step=None
+            )
             return None
         signature = self._run_signature(asset_type, portfolio)
         self._checkpointer_ctx = get_checkpointer(self.config["data_cache_dir"], company_name)
@@ -485,6 +540,11 @@ class TradingAgentsGraph:
             logger.info("Resuming from step %d for %s on %s", step, company_name, trade_date)
         else:
             logger.info("Starting fresh for %s on %s", company_name, trade_date)
+        # A resumed run only replays the nodes it has left, so the nodes already
+        # committed to the checkpoint are never observed again this run.
+        self._observe(
+            CHECKPOINT_INITIALIZED, enabled=True, resuming=self._resuming, step=step
+        )
         return thread_id(company_name, str(trade_date), signature)
 
     def checkpoint_input(self, init_state):
@@ -534,7 +594,9 @@ class TradingAgentsGraph:
                 / "reports"
                 / f"{safe_ticker_component(ticker)}_{stamp}"
             )
-        return write_report_tree(final_state, ticker, save_path)
+        report_path = write_report_tree(final_state, ticker, save_path)
+        self._observe(REPORTS_SAVED, ticker=ticker, path=str(report_path))
+        return report_path
 
     def create_run_state(self, company_name, trade_date, asset_type: str = "stock", portfolio=None):
         """Build a run's initial state; propagate() and the CLI both start here.
@@ -544,15 +606,27 @@ class TradingAgentsGraph:
         resolved instrument identity for every agent (#814). An entry point that
         assembled the state itself would skip the decision log.
         """
+        self._observe(
+            PREPARING,
+            company=company_name,
+            trade_date=str(trade_date),
+            asset_type=asset_type,
+        )
         self._resolve_pending_entries(company_name)
+        past_context = self.memory_log.get_past_context(
+            company_name, as_of=self._memory_as_of(trade_date)
+        )
+        self._observe(MEMORY_RESOLVED, has_past_context=bool(past_context))
+        instrument_context = self.resolve_instrument_context(
+            company_name, asset_type, trade_date
+        )
+        self._observe(IDENTITY_RESOLVED, has_instrument_context=bool(instrument_context))
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
-            past_context=self.memory_log.get_past_context(
-                company_name, as_of=self._memory_as_of(trade_date)
-            ),
-            instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
+            past_context=past_context,
+            instrument_context=instrument_context,
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
         )
 
@@ -580,7 +654,7 @@ class TradingAgentsGraph:
                    checkpoint_thread_id: str | None = None, portfolio=None):
         """Execute the graph and write the resulting state to disk and memory log."""
         init_agent_state = self.create_run_state(company_name, trade_date, asset_type, portfolio)
-        args = self.propagator.get_graph_args()
+        args = self.propagator.get_graph_args(callbacks=self.observation_callbacks())
 
         # Inject the checkpoint thread_id (from checkpoint_scope) so the same
         # ticker+date+graph-shape resumes; a different one starts fresh (#1089).
@@ -622,7 +696,11 @@ class TradingAgentsGraph:
         # Clear checkpoint on successful completion to avoid stale state.
         self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
 
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        signal = self.process_signal(final_state["final_trade_decision"])
+        self._observe(
+            ANALYSIS_COMPLETED, company=company_name, trade_date=str(trade_date), signal=signal
+        )
+        return final_state, signal
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

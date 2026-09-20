@@ -1,23 +1,26 @@
-"""The generic graph observation adapter (design 11.2, first half of TA04).
+"""Optional progress observations on the shared propagation path (design 11.2).
 
-These tests drive the real seams: an analyst/tool/message-clear path and the
-research/risk nodes through the installed LangGraph and ``ToolNode``, with the
-handler attached the way a caller attaches it — through the graph invocation
-config. Nothing here calls a provider or the network, and nothing here changes
-how ``propagate`` runs.
+``propagate`` stays the owner of a run's lifecycle; when a caller passes an
+``observer`` it also reports that lifecycle. These tests drive the real seams:
+an analyst/tool/message-clear path and the research/risk nodes through the
+installed LangGraph and ``ToolNode``, the checkpoint interrupt/resume
+lifecycle, and the outer steps ``propagate`` performs around the graph. Nothing
+here calls a provider or the network.
 
 Observed behavior of the installed SDKs (langgraph 1.2.11 / langgraph-prebuilt
 1.1.0 / langchain-core 1.6.3) that this relies on: LangGraph reports each node's
 own run to the invocation config's callbacks, tagged ``graph:step:<n>`` with
 ``langgraph_node`` metadata, while the conditional router, chat model and tools
 nested in that node are tagged ``seq:step:<n>``; a node's ``on_chain_end``
-carries the state update it returned; and a handler that raises is absorbed by
-langchain-core rather than ending the run.
+carries the state update it returned; a handler that raises is absorbed by
+langchain-core rather than ending the run; and resuming with ``None`` replays
+only the nodes that had not been committed.
 """
 
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -29,10 +32,16 @@ from langgraph.prebuilt import ToolNode
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.agents.utils.agent_utils import create_msg_delete
 from tradingagents.graph.observation import (
+    ANALYSIS_COMPLETED,
+    CHECKPOINT_INITIALIZED,
+    IDENTITY_RESOLVED,
+    MEMORY_RESOLVED,
     NODE_COMPLETED,
     NODE_FAILED,
     NODE_STARTED,
+    PREPARING,
     REPORT_AVAILABLE,
+    REPORTS_SAVED,
     STAGE_COMPLETED,
     TOOL_COMPLETED,
     TOOL_STARTED,
@@ -41,10 +50,12 @@ from tradingagents.graph.observation import (
     emit,
 )
 from tradingagents.graph.propagation import Propagator
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 _REPORT = "Market report: the trend is up."
 _TICKER = "AAPL"
 _DATE = "2026-05-08"
+_FINAL_STATE = {"final_trade_decision": "FINAL: Buy"}
 
 
 @tool
@@ -302,3 +313,189 @@ def test_a_failing_listener_does_not_end_the_analysis(caplog):
 @pytest.mark.unit
 def test_emit_without_an_observer_is_a_no_op():
     emit(None, GraphObservation(type=NODE_STARTED, node="Market Analyst"))
+
+
+@pytest.mark.unit
+def test_without_an_observer_the_invocation_is_unchanged():
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
+
+    assert graph.observer is None
+    assert graph.observation_callbacks() is None
+    # No callbacks key at all, so the graph is invoked exactly as before.
+    assert Propagator().get_graph_args(callbacks=None) == {
+        "stream_mode": "values",
+        "config": {"recursion_limit": 100},
+    }
+
+
+@pytest.mark.unit
+def test_the_observation_handler_is_not_an_llm_callback():
+    """The LLM-bound callbacks never travel into the graph configuration."""
+    stats = object()
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
+    graph.callbacks = [stats]
+    graph.observer = lambda observation: None
+
+    callbacks = graph.observation_callbacks()
+
+    assert len(callbacks) == 1
+    assert isinstance(callbacks[0], GraphObservationHandler)
+    assert stats not in callbacks
+
+
+def _checkpointed_graph(tmp_path, observer, *, crash_at_clear=False):
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {
+        "checkpoint_enabled": True,
+        "data_cache_dir": str(tmp_path),
+        "max_debate_rounds": 1,
+        "max_risk_discuss_rounds": 1,
+    }
+    graph.selected_analysts = ("market",)
+    graph.observer = observer
+    graph.propagator = Propagator()
+    graph.workflow = _analyst_workflow(crash_at_clear=crash_at_clear)
+    graph.graph = graph.workflow.compile()
+    graph._checkpointer_ctx = None
+    graph._resuming = False
+    return graph
+
+
+def _invoke(graph, thread_id_value, graph_input):
+    args = graph.propagator.get_graph_args(callbacks=graph.observation_callbacks())
+    args["config"].setdefault("configurable", {})["thread_id"] = thread_id_value
+    return graph.graph.invoke(graph_input, **args)
+
+
+@pytest.mark.unit
+def test_interrupt_and_resume_reports_without_replaying_the_graph(tmp_path):
+    state = _initial_state()
+    seen1, observer1 = _collect()
+    first = _checkpointed_graph(tmp_path, observer1, crash_at_clear=True)
+    thread = first.begin_checkpoint(_TICKER, _DATE, "stock")
+    try:
+        assert first.checkpoint_input(state) is state
+        with pytest.raises(RuntimeError):
+            _invoke(first, thread, state)
+    finally:
+        first.end_checkpoint()
+
+    seen2, observer2 = _collect()
+    second = _checkpointed_graph(tmp_path, observer2)
+    resumed_thread = second.begin_checkpoint(_TICKER, _DATE, "stock")
+    try:
+        assert resumed_thread == thread
+        assert second.checkpoint_input(state) is None  # resume, never re-send state
+        result = _invoke(second, resumed_thread, second.checkpoint_input(state))
+        second.clear_checkpoint_on_success(_TICKER, _DATE, "stock")
+    finally:
+        second.end_checkpoint()
+
+    assert result["market_report"] == _REPORT
+    # Only the uncommitted node runs again, and the message-clear node rebuilt
+    # exactly one placeholder: the analyst turns were not replayed or appended.
+    assert [o.node for o in seen2 if o.type == NODE_STARTED] == ["Msg Clear Market"]
+    assert len([o for o in seen1 if o.type == NODE_STARTED and o.node == "Market Analyst"]) == 2
+    assert len(result["messages"]) == 1
+
+    assert [o.payload for o in seen1 if o.type == CHECKPOINT_INITIALIZED] == [
+        {"enabled": True, "resuming": False, "step": None}
+    ]
+    resume = next(o for o in seen2 if o.type == CHECKPOINT_INITIALIZED)
+    assert resume.payload["resuming"] is True
+    assert resume.payload["step"] is not None
+
+
+def _propagate_graph(tmp_path, observer, captured):
+    """A graph whose only real parts are the lifecycle propagate() owns."""
+
+    def invoke(graph_input, **kwargs):
+        captured.append(kwargs)
+        return _FINAL_STATE
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {
+        "checkpoint_enabled": False,
+        "data_cache_dir": str(tmp_path),
+        "results_dir": str(tmp_path / "results"),
+        "max_debate_rounds": 1,
+        "max_risk_discuss_rounds": 1,
+    }
+    graph.selected_analysts = ("market",)
+    graph.observer = observer
+    graph.debug = False
+    graph.propagator = Propagator()
+    graph._checkpointer_ctx = None
+    graph._resuming = False
+    graph.memory_log = SimpleNamespace(
+        get_past_context=lambda *a, **k: "past lesson",
+        store_decision=lambda **k: None,
+    )
+    graph.signal_processor = SimpleNamespace(process_signal=lambda text: "Buy")
+    graph.graph = SimpleNamespace(invoke=invoke)
+    graph._resolve_pending_entries = lambda ticker: None
+    graph.resolve_instrument_context = lambda *a, **k: f"{_TICKER} (Apple Inc.)"
+    # Disk logging is a separate concern with its own tests; the lifecycle is
+    # what this exercises.
+    graph._log_state = lambda *a, **k: None
+    return graph
+
+
+@pytest.mark.unit
+def test_propagate_reports_the_lifecycle_it_owns_outside_the_graph(tmp_path):
+    seen, observer = _collect()
+    captured = []
+    graph = _propagate_graph(tmp_path, observer, captured)
+
+    state, signal = graph.propagate(_TICKER, _DATE)
+
+    assert (state, signal) == (_FINAL_STATE, "Buy")  # return values untouched
+    # The observation handler reached the graph through the existing invocation
+    # arguments, and nothing else was added to them.
+    forwarded = captured[0]["config"]["callbacks"]
+    assert len(forwarded) == 1
+    assert isinstance(forwarded[0], GraphObservationHandler)
+    assert captured[0]["stream_mode"] == "values"
+
+    assert [o.type for o in seen] == [
+        CHECKPOINT_INITIALIZED,
+        PREPARING,
+        MEMORY_RESOLVED,
+        IDENTITY_RESOLVED,
+        ANALYSIS_COMPLETED,
+    ]
+    assert seen[0].payload == {"enabled": False, "resuming": False, "step": None}
+    assert seen[1].payload == {
+        "company": _TICKER,
+        "trade_date": _DATE,
+        "asset_type": "stock",
+    }
+    assert seen[2].payload == {"has_past_context": True}
+    assert seen[3].payload == {"has_instrument_context": True}
+    assert seen[4].payload == {"company": _TICKER, "trade_date": _DATE, "signal": "Buy"}
+
+
+@pytest.mark.unit
+def test_propagate_without_an_observer_forwards_nothing(tmp_path):
+    captured = []
+    graph = _propagate_graph(tmp_path, None, captured)
+
+    assert graph.propagate(_TICKER, _DATE) == (_FINAL_STATE, "Buy")
+    assert "callbacks" not in captured[0]["config"]
+
+
+@pytest.mark.unit
+def test_saving_reports_reports_where_they_landed(tmp_path):
+    seen, observer = _collect()
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"results_dir": str(tmp_path)}
+    graph.observer = observer
+
+    path = graph.save_reports({"market_report": _REPORT}, _TICKER)
+
+    assert path.exists()
+    assert [o.payload for o in seen if o.type == REPORTS_SAVED] == [
+        {"ticker": _TICKER, "path": str(path)}
+    ]

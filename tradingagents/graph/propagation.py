@@ -76,6 +76,11 @@ class Propagator:
         Args:
             callbacks: Optional list of callback handlers for tool execution tracking.
                        Note: LLM callbacks are handled separately via LLM constructor.
+                       This is also the seam the optional progress observation
+                       handler travels through
+                       (``TradingAgentsGraph.observation_callbacks``), because
+                       LangGraph reports node runs to the invocation config
+                       rather than to the LLM clients.
         """
         config = {"recursion_limit": self.max_recur_limit}
         if callbacks:

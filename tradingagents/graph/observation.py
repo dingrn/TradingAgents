@@ -1,17 +1,22 @@
 # TradingAgents/graph/observation.py
 
-"""Generic observations of a LangGraph run's progress.
+"""Generic observations of a run's progress.
 
-A caller that wants live visibility into a run builds a
-:class:`GraphObservationHandler` around its own ``observer`` callable and hands
-it to the graph invocation config, which is where LangGraph reports node runs.
-The handler turns those callbacks into :class:`GraphObservation` records: a
-type, the stage and node they belong to, and a payload of values TA already
-had. TA does not know what an observer does with them, and an observer that
-raises never ends a run that is already paying for model calls (:func:`emit`).
+A caller that wants live visibility into a run passes ``observer=`` to
+:class:`~tradingagents.graph.trading_graph.TradingAgentsGraph`, which forwards a
+:class:`GraphObservationHandler` through the graph invocation config and also
+reports the outer preparation, memory, identity, resume and completion steps it
+performs around the graph. A caller driving LangGraph itself can build the
+handler directly and hand it to that config, which is where LangGraph reports
+node runs.
 
-Events come from LangGraph's own run metadata (``langgraph_node``, plus the
-``graph:step:`` run tag that marks a node's own run rather than the router,
+The records are plain TA data: a type, the stage and node they belong to, and a
+payload of values TA already had. TA does not know what an observer does with
+them, and an observer that raises never ends a run that is already paying for
+model calls (:func:`emit`).
+
+Graph events come from LangGraph's own run metadata (``langgraph_node``, plus
+the ``graph:step:`` run tag that marks a node's own run rather than the router,
 model and tool runs nested inside it) and from the state each node returns —
 never from agent prose. An analyst report is announced only once its state
 field is actually filled, and an analyst stage completes on its message-clear
@@ -35,6 +40,14 @@ from langchain_core.callbacks import BaseCallbackHandler
 from .analyst_execution import ANALYST_NODE_SPECS
 
 logger = logging.getLogger(__name__)
+
+# Outer lifecycle: the work propagate() owns around the graph.
+PREPARING = "preparing"
+MEMORY_RESOLVED = "memory_resolved"
+IDENTITY_RESOLVED = "identity_resolved"
+CHECKPOINT_INITIALIZED = "checkpoint_initialized"
+ANALYSIS_COMPLETED = "analysis_completed"
+REPORTS_SAVED = "reports_saved"
 
 # Graph lifecycle: reported from LangGraph run metadata and node state.
 NODE_STARTED = "node_started"

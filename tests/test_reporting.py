@@ -1,8 +1,6 @@
 """Report parity: the shared writer produces the report tree for the CLI and the
 programmatic API alike (#1037)."""
 
-from types import SimpleNamespace
-
 import pytest
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -35,16 +33,19 @@ def test_write_report_tree_creates_files(tmp_path):
 
 @pytest.mark.unit
 def test_save_reports_explicit_path(tmp_path):
-    # Unbound: with an explicit save_path, the method doesn't touch self/config.
-    out = TradingAgentsGraph.save_reports(None, _state(), "AAPL", save_path=tmp_path)
+    # An explicit save_path skips config entirely; the method still reports
+    # where the reports landed, so it runs on a real (unobserved) instance.
+    graph = object.__new__(TradingAgentsGraph)
+    out = graph.save_reports(_state(), "AAPL", save_path=tmp_path)
     assert (tmp_path / "complete_report.md").exists()
     assert out == tmp_path / "complete_report.md"
 
 
 @pytest.mark.unit
 def test_save_reports_defaults_under_results_dir(tmp_path):
-    mock_self = SimpleNamespace(config={"results_dir": str(tmp_path)})
-    out = TradingAgentsGraph.save_reports(mock_self, _state(), "AAPL")
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"results_dir": str(tmp_path)}
+    out = graph.save_reports(_state(), "AAPL")
     assert out.exists()
     assert out.parent.parent.name == "reports"  # results_dir/reports/AAPL_<stamp>/...
     assert out.parent.name.startswith("AAPL_")
