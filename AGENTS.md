@@ -98,7 +98,14 @@ Each rule names the owning module.
 5. **Vendor routing is centralized.** New data tools/vendors register in
    `tradingagents/dataflows/interface.py` (`VENDOR_METHODS`, categories). Core
    categories fail loud; `macro_data` and `prediction_markets` are optional
-   and degrade. Agents must not call a vendor module, bypassing the interface.
+   and degrade. The chain always runs to exhaustion before deciding, and
+   precedence is no-data, then a real error (auth/config/other), then
+   throttling. A required chain that ends entirely throttled raises
+   `VendorChainRateLimitError` — typed, carrying each vendor's error and any
+   structured `Retry-After` — so it stays an exception through `ToolNode`
+   instead of becoming tool-error prose; optional categories still degrade to
+   their sentinel. Agents must not call a vendor module, bypassing the
+   interface.
 6. **LLM factory stays lazy.** `tradingagents/llm_clients/factory.py` imports
    provider modules inside the function. New providers go through the
    factory/registry. OpenAI-compatible endpoints use that path, not a one-off

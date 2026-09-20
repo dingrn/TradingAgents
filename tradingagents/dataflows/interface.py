@@ -14,6 +14,7 @@ from .alpha_vantage import (
 from .config import get_config
 from .errors import (
     NoMarketDataError,
+    VendorChainRateLimitError,
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
@@ -202,7 +203,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_chain = all_available_vendors
 
     last_no_data: NoMarketDataError | None = None
-    last_unavailable: VendorRateLimitError | None = None
+    rate_limited: dict[str, VendorRateLimitError] = {}
     first_error: Exception | None = None
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
@@ -212,9 +213,12 @@ def route_to_vendor(method: str, *args, **kwargs):
             return impl_func(*args, **kwargs)
         except VendorRateLimitError as e:
             logger.warning("Vendor %r unavailable for %s: %s; trying next vendor.", vendor, method, e)
-            # Kept so an all-unavailable chain can say the vendor was the
-            # problem, rather than reporting nothing about the symbol.
-            last_unavailable = e
+            # Kept per vendor so an all-throttled chain can name every vendor it
+            # tried, and keep whatever structured retry timing they supplied,
+            # rather than reporting nothing about the symbol. The chain always
+            # runs to the end first: one throttled vendor must not abort a
+            # fallback that can still serve the call.
+            rate_limited[vendor] = e
             continue
         except VendorNotConfiguredError as e:
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
@@ -260,18 +264,12 @@ def route_to_vendor(method: str, *args, **kwargs):
         )
 
     # No vendor returned data and none reported clean "no data" — surface the
-    # first real error (e.g. the primary vendor's network failure). Optional
-    # enrichment categories degrade to a sentinel instead, so flavour data can't
-    # abort the run.
-    # Every vendor was throttled or unreachable: that is a fact about the
-    # vendors, not about the instrument, and it must not end the run.
-    if last_unavailable is not None:
-        return (
-            f"DATA_UNAVAILABLE: no configured vendor could serve {method} right now "
-            f"({last_unavailable}). This says nothing about the instrument; report the "
-            f"data as unavailable and do not estimate or fabricate values."
-        )
-
+    # first real error (e.g. the primary vendor's network failure, or a bad
+    # key). This outranks a throttle seen later in the chain: an authentication
+    # or configuration fault is actionable and would be hidden if a subsequent
+    # vendor's "try again later" spoke for the whole chain. Optional enrichment
+    # categories degrade to a sentinel instead, so flavour data can't abort the
+    # run.
     if first_error is not None:
         if category in OPTIONAL_CATEGORIES:
             logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
@@ -280,5 +278,23 @@ def route_to_vendor(method: str, *args, **kwargs):
                 f"({first_error}). Proceed without it; do not fabricate values."
             )
         raise first_error
+
+    # Every vendor was throttled or unreachable: that is a fact about the
+    # vendors, not about the instrument.
+    if rate_limited:
+        last_throttle = list(rate_limited.values())[-1]
+        if category in OPTIONAL_CATEGORIES:
+            # Optional enrichment still degrades: flavour data must never turn
+            # an otherwise usable analysis into a failed, retried job.
+            logger.warning("Optional %s throttled for %s: %s", category, method, last_throttle)
+            return (
+                f"DATA_UNAVAILABLE: no configured vendor could serve {method} right now "
+                f"({last_throttle}). This says nothing about the instrument; report the "
+                f"data as unavailable and do not estimate or fabricate values."
+            )
+        # Required data: raise the typed condition instead of a sentinel string
+        # so a caller can schedule a retry on evidence rather than on prose,
+        # and so it is never mistaken for a verdict about the instrument.
+        raise VendorChainRateLimitError(method, rate_limited) from last_throttle
 
     raise RuntimeError(f"No available vendor for '{method}'")

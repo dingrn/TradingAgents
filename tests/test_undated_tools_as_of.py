@@ -213,19 +213,28 @@ def test_an_unreachable_vendor_is_not_reported_as_a_missing_symbol(monkeypatch):
 @pytest.mark.unit
 def test_every_vendor_unavailable_says_so_rather_than_crashing(monkeypatch):
     """A throttled or unreachable chain used to raise RuntimeError('No available
-    vendor'), which ends the run, and never said the vendor was the problem."""
+    vendor'), which ends the run, and never said the vendor was the problem.
+
+    It now ends in the typed throttle instead, so a caller can retry on
+    evidence — but it still must never read as a verdict about the symbol."""
     from tradingagents.dataflows import interface
-    from tradingagents.dataflows.errors import VendorRateLimitError
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.dataflows.errors import VendorChainRateLimitError, VendorRateLimitError
 
     def _down(*a, **k):
         raise VendorRateLimitError("Yahoo Finance is unreachable")
 
+    # Pin the chain: with the full default chain the outcome would depend on
+    # whether Alpha Vantage and SEC answer, which is not what this asserts.
+    set_config({"data_vendors": {"fundamental_data": "yfinance"}})
     monkeypatch.setitem(interface.VENDOR_METHODS["get_balance_sheet"], "yfinance", _down)
 
-    out = interface.route_to_vendor("get_balance_sheet", "AAPL", "annual", "2026-09-01")
+    with pytest.raises(VendorChainRateLimitError) as caught:
+        interface.route_to_vendor("get_balance_sheet", "AAPL", "annual", "2026-09-01")
 
-    assert "unavailable" in out.lower() and "unreachable" in out.lower()
-    assert "delisted" not in out.lower()  # not a claim about the symbol
+    message = str(caught.value).lower()
+    assert "rate limited" in message and "unreachable" in message
+    assert "delisted" not in message  # not a claim about the symbol
 
 
 @pytest.mark.unit

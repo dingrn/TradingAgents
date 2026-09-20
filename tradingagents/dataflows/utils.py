@@ -1,5 +1,6 @@
 import re
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -62,6 +63,34 @@ def get_scrubbed(url: str, *, params: dict, timeout: float, secret: str, passthr
     except requests.RequestException as exc:
         error = type(exc)(str(exc).replace(secret, "***")) if secret else exc
     raise error
+
+
+def retry_after_seconds(response) -> float | None:
+    """The wait a vendor asked for in its ``Retry-After`` header, in seconds.
+
+    Both RFC 9110 forms are read: delta-seconds and an HTTP-date. Anything
+    else returns None, because the header is the only structured statement
+    available here — a number reconstructed from a throttle message's prose
+    would schedule retries on fiction.
+    """
+    headers = getattr(response, "headers", None) or {}
+    raw = headers.get("Retry-After")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
 def vendor_reachable(url: str, timeout: float = 5.0) -> bool:

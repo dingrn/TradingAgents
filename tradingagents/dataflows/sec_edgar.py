@@ -29,6 +29,7 @@ import requests
 
 from .config import get_config
 from .errors import NoMarketDataError, VendorRateLimitError
+from .utils import retry_after_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +105,16 @@ def _fetch_json(url: str) -> dict:
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
         # Every failure here is "this vendor cannot serve it now", so the router
         # moves on instead of seeing a transport exception it has no rule for.
-        raise VendorRateLimitError(f"SEC EDGAR request failed ({status or type(exc).__name__})") from exc
+        # A 429/503 usually names its own wait; carry it so a retry is scheduled
+        # on what SEC said rather than on a guess.
+        raise VendorRateLimitError(
+            f"SEC EDGAR request failed ({status or type(exc).__name__})",
+            retry_after=retry_after_seconds(response),
+        ) from exc
     except ValueError as exc:
         raise VendorRateLimitError("SEC EDGAR returned an unreadable response") from exc
 
