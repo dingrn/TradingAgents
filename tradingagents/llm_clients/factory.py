@@ -16,6 +16,13 @@ def resolve_llm_routing(
 ) -> LLMRoutingResolution:
     """Resolve effective non-secret routing while retaining lazy SDK imports."""
     provider_lower = provider.lower()
+    if provider_lower == "bedrock":
+        from .bedrock_client import resolve_bedrock_routing
+
+        return resolve_bedrock_routing(
+            model, base_url, environment=environment, **kwargs
+        )
+
     if provider_lower == "azure":
         from .azure_client import resolve_azure_routing
 
