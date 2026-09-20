@@ -1,9 +1,20 @@
+import os
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
 
 from .base_client import BaseLLMClient, normalize_content
+from .routing import (
+    GATEWAY_ENDPOINT_ENVIRONMENT_VARIABLE,
+    LLMRoutingResolution,
+    ResolvedRoutingValue,
+    UnsupportedRoutingSelectorError,
+    ensure_non_secret_endpoint,
+    resolve_gateway_routing,
+)
 from .validators import validate_model
 
 _PASSTHROUGH_KWARGS = (
@@ -50,6 +61,84 @@ class NormalizedChatAnthropic(ChatAnthropic):
         return normalize_content(super().invoke(input, config, **kwargs))
 
 
+# ChatAnthropic reads these when no explicit base URL is supplied, in this order,
+# before falling back to the LangSmith gateway and then its own default.
+_ENDPOINT_ENVIRONMENT_VARIABLES = ("ANTHROPIC_API_URL", "ANTHROPIC_BASE_URL")
+_CREDENTIAL_ENVIRONMENT_VARIABLES = ("ANTHROPIC_API_KEY",)
+_SDK_DEFAULT_ENDPOINT = "https://api.anthropic.com"
+# A proxy redirects every call, but its URL can carry credentials, so the name is
+# reported as a routing input instead of its value being resolved.
+_PROXY_ENVIRONMENT_VARIABLE = "ANTHROPIC_PROXY"
+
+# Selectors ChatAnthropic accepts but this client never forwards, so a caller
+# supplying one would get routing that differs from the resolved identity.
+_UNSUPPORTED_ROUTING_KWARGS = frozenset(
+    {"anthropic_api_url", "anthropic_proxy", "default_headers"}
+)
+
+
+@dataclass(frozen=True)
+class _AnthropicSettings:
+    routing: LLMRoutingResolution
+    client_base_url: str | None
+
+
+def _resolve_anthropic_settings(
+    model: str,
+    base_url: str | None,
+    environment: Mapping[str, str],
+    kwargs: Mapping[str, Any],
+) -> _AnthropicSettings:
+    unsupported = sorted(_UNSUPPORTED_ROUTING_KWARGS.intersection(kwargs))
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise UnsupportedRoutingSelectorError(
+            f"Anthropic routing cannot resolve unsupported selector(s): {names}"
+        )
+
+    gateway = resolve_gateway_routing(
+        environment,
+        provider_path="anthropic",
+        credential_kind="api_key",
+        explicit_endpoint=base_url,
+        explicit_credential=kwargs.get("api_key"),
+        endpoint_environment_variables=_ENDPOINT_ENVIRONMENT_VARIABLES,
+        credential_environment_variables=_CREDENTIAL_ENVIRONMENT_VARIABLES,
+        default_endpoint=_SDK_DEFAULT_ENDPOINT,
+    )
+    ensure_non_secret_endpoint(gateway.endpoint.value, "Anthropic endpoint")
+
+    routing = LLMRoutingResolution(
+        provider="anthropic",
+        model=model,
+        endpoint=gateway.endpoint,
+        protocol=ResolvedRoutingValue("anthropic_messages", "provider_default"),
+        credential=gateway.credential,
+        routing_environment_variables=(
+            *_ENDPOINT_ENVIRONMENT_VARIABLES,
+            _PROXY_ENVIRONMENT_VARIABLE,
+            GATEWAY_ENDPOINT_ENVIRONMENT_VARIABLE,
+        ),
+    )
+    # Only a caller-supplied URL reaches ChatAnthropic: passing a resolved
+    # default instead would suppress the SDK's own gateway precedence.
+    return _AnthropicSettings(routing, base_url or None)
+
+
+def resolve_anthropic_routing(
+    model: str,
+    base_url: str | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    **kwargs: Any,
+) -> LLMRoutingResolution:
+    """Resolve Anthropic routing without exposing credential values."""
+    selected_environment = os.environ if environment is None else environment
+    return _resolve_anthropic_settings(
+        model, base_url, selected_environment, kwargs
+    ).routing
+
+
 class AnthropicClient(BaseLLMClient):
     """Client for Anthropic Claude models."""
 
@@ -61,8 +150,11 @@ class AnthropicClient(BaseLLMClient):
         self.warn_if_unknown_model()
         llm_kwargs = {"model": self.model}
 
-        if self.base_url:
-            llm_kwargs["base_url"] = self.base_url
+        settings = _resolve_anthropic_settings(
+            self.model, self.base_url, os.environ, self.kwargs
+        )
+        if settings.client_base_url:
+            llm_kwargs["base_url"] = settings.client_base_url
 
         for key in _PASSTHROUGH_KWARGS:
             if key not in self.kwargs:

@@ -8,7 +8,11 @@ import sys
 
 import pytest
 
-from tradingagents.llm_clients import resolve_llm_routing
+from tradingagents.llm_clients import (
+    UnsupportedRoutingSelectorError,
+    create_llm_client,
+    resolve_llm_routing,
+)
 from tradingagents.llm_clients.openai_client import (
     OPENAI_COMPATIBLE_PROVIDERS,
     DeepSeekChatOpenAI,
@@ -17,6 +21,22 @@ from tradingagents.llm_clients.openai_client import (
     NormalizedChatOpenAI,
     is_openai_compatible,
 )
+
+_AMBIENT_ROUTING_ENV_VARS = (
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_BASE_URL",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "LANGSMITH_GATEWAY",
+    "LANGSMITH_GATEWAY_API_KEY",
+    "LANGSMITH_API_KEY",
+)
+
+
+@pytest.fixture()
+def clean_routing_env(monkeypatch):
+    """Drop ambient endpoint/gateway selectors so precedence is exactly asserted."""
+    for name in _AMBIENT_ROUTING_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.mark.unit
@@ -164,4 +184,213 @@ def test_azure_routing_fails_when_required_sdk_selector_is_unresolved(
 @pytest.mark.unit
 def test_unimplemented_provider_routing_is_not_guessed():
     with pytest.raises(ValueError, match="not implemented"):
-        resolve_llm_routing("anthropic", "claude")
+        resolve_llm_routing("cohere", "command-r")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "base_url,environment,endpoint,source,variable",
+    [
+        (
+            "https://explicit.example/",
+            {"ANTHROPIC_API_URL": "https://api-url.example/"},
+            "https://explicit.example/",
+            "explicit",
+            None,
+        ),
+        (
+            None,
+            {
+                "ANTHROPIC_API_URL": "https://api-url.example/",
+                "ANTHROPIC_BASE_URL": "https://base.example/",
+            },
+            "https://api-url.example/",
+            "environment",
+            "ANTHROPIC_API_URL",
+        ),
+        (
+            None,
+            {"ANTHROPIC_BASE_URL": "https://base.example/"},
+            "https://base.example/",
+            "environment",
+            "ANTHROPIC_BASE_URL",
+        ),
+        (
+            None,
+            {"LANGSMITH_GATEWAY": "https://gw.example/"},
+            "https://gw.example/anthropic",
+            "gateway",
+            "LANGSMITH_GATEWAY",
+        ),
+        (None, {}, "https://api.anthropic.com", "sdk_default", None),
+    ],
+)
+def test_anthropic_endpoint_precedence(base_url, environment, endpoint, source, variable):
+    resolved = resolve_llm_routing(
+        "anthropic", "claude-sonnet-5", base_url, environment=environment
+    )
+
+    assert resolved.endpoint.value == endpoint
+    assert resolved.endpoint.source == source
+    assert resolved.endpoint.environment_variable == variable
+    assert resolved.protocol.value == "anthropic_messages"
+    assert "ANTHROPIC_PROXY" in resolved.routing_environment_variables
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "environment,expected",
+    [
+        (
+            {
+                "LANGSMITH_GATEWAY": "true",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-secret",
+                "ANTHROPIC_API_KEY": "provider-secret",
+            },
+            "LANGSMITH_GATEWAY_API_KEY",
+        ),
+        (
+            {
+                "LANGSMITH_GATEWAY": "true",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-secret",
+                "ANTHROPIC_API_KEY": "provider-secret",
+                "ANTHROPIC_API_URL": "https://direct.example/",
+            },
+            "ANTHROPIC_API_KEY",
+        ),
+    ],
+)
+def test_anthropic_gateway_key_follows_the_endpoint_it_belongs_to(environment, expected):
+    # The gateway key is only sent when the endpoint itself came from the gateway.
+    resolved = resolve_llm_routing("anthropic", "claude-sonnet-5", environment=environment)
+
+    assert resolved.credential.present is True
+    assert resolved.credential.environment_variable == expected
+    assert "gateway-secret" not in repr(resolved)
+    assert "provider-secret" not in repr(resolved)
+
+
+@pytest.mark.unit
+def test_anthropic_resolution_matches_the_installed_sdk(monkeypatch, clean_routing_env):
+    # Fails loudly if langchain-anthropic changes the rule this mirrors.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://relay.example/")
+
+    resolved = resolve_llm_routing(
+        "anthropic", "claude-sonnet-5", environment=dict(os.environ)
+    )
+    llm = create_llm_client("anthropic", "claude-sonnet-5").get_llm()
+
+    assert llm.anthropic_api_url == resolved.endpoint.value == "https://relay.example/"
+
+
+@pytest.mark.unit
+def test_anthropic_selectors_the_client_never_forwards_are_not_guessed():
+    with pytest.raises(UnsupportedRoutingSelectorError, match="anthropic_proxy"):
+        resolve_llm_routing(
+            "anthropic",
+            "claude-sonnet-5",
+            environment={},
+            anthropic_proxy="http://proxy.example",
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "base_url,environment,endpoint,source",
+    [
+        (None, {}, "https://generativelanguage.googleapis.com/", "sdk_default"),
+        ("https://explicit.example/", {}, "https://explicit.example/", "explicit"),
+        (
+            None,
+            {"LANGSMITH_GATEWAY": "true"},
+            "https://gateway.smith.langchain.com/gemini",
+            "gateway",
+        ),
+    ],
+)
+def test_google_developer_endpoint_precedence(base_url, environment, endpoint, source):
+    resolved = resolve_llm_routing(
+        "google", "gemini-3.5-flash", base_url, environment=environment
+    )
+
+    assert resolved.endpoint.value == endpoint
+    assert resolved.endpoint.source == source
+    assert resolved.protocol.value == "gemini_developer"
+    assert resolved.api_version.value == "v1beta"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "environment,expected",
+    [
+        ({"GOOGLE_API_KEY": "primary", "GEMINI_API_KEY": "fallback"}, "GOOGLE_API_KEY"),
+        ({"GEMINI_API_KEY": "fallback"}, "GEMINI_API_KEY"),
+    ],
+)
+def test_google_credential_order_matches_the_sdk(environment, expected):
+    resolved = resolve_llm_routing(
+        "google", "gemini-3.5-flash", environment=environment
+    )
+
+    assert resolved.credential.environment_variable == expected
+    assert "primary" not in repr(resolved)
+    assert "fallback" not in repr(resolved)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "environment,kwargs",
+    [
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "true"}, {}),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "1"}, {}),
+        ({}, {"project": "my-project"}),
+        ({}, {"location": "us-central1"}),
+        ({}, {"vertexai": True}),
+        ({}, {"credentials": "adc-object"}),
+    ],
+)
+def test_google_vertex_selection_is_reported_as_unsupported(environment, kwargs):
+    # Vertex routing depends on project/credential state this client cannot read,
+    # so it is rejected rather than guessed.
+    with pytest.raises(UnsupportedRoutingSelectorError):
+        resolve_llm_routing(
+            "google", "gemini-3.5-flash", environment=environment, **kwargs
+        )
+
+
+@pytest.mark.unit
+def test_google_client_construction_is_unchanged_when_vertex_is_selected(monkeypatch):
+    from tradingagents.llm_clients import google_client
+
+    captured = {}
+
+    class StubGoogleChat:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        google_client, "NormalizedChatGoogleGenerativeAI", StubGoogleChat
+    )
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+
+    google_client.GoogleClient("gemini-3.5-flash", api_key="explicit-key").get_llm()
+
+    assert captured["google_api_key"] == "explicit-key"
+    assert "base_url" not in captured
+
+
+@pytest.mark.unit
+def test_google_resolution_matches_the_installed_sdk(monkeypatch, clean_routing_env):
+    # Fails loudly if langchain-google-genai changes the rule this mirrors.
+    monkeypatch.setenv("LANGSMITH_GATEWAY", "https://gw.example")
+
+    resolved = resolve_llm_routing(
+        "google", "gemini-3.5-flash", environment=dict(os.environ)
+    )
+    llm = create_llm_client(
+        "google", "gemini-3.5-flash", api_key="placeholder"
+    ).get_llm()
+    http_options = llm.client._api_client._http_options
+
+    assert http_options.base_url == resolved.endpoint.value == "https://gw.example/gemini"
+    assert http_options.api_version == resolved.api_version.value

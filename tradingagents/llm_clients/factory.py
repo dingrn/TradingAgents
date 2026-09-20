@@ -16,6 +16,20 @@ def resolve_llm_routing(
 ) -> LLMRoutingResolution:
     """Resolve effective non-secret routing while retaining lazy SDK imports."""
     provider_lower = provider.lower()
+    if provider_lower == "anthropic":
+        from .anthropic_client import resolve_anthropic_routing
+
+        return resolve_anthropic_routing(
+            model, base_url, environment=environment, **kwargs
+        )
+
+    if provider_lower == "google":
+        from .google_client import resolve_google_routing
+
+        return resolve_google_routing(
+            model, base_url, environment=environment, **kwargs
+        )
+
     if provider_lower == "bedrock":
         from .bedrock_client import resolve_bedrock_routing
 

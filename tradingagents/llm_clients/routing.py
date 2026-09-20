@@ -87,9 +87,20 @@ class LLMRoutingResolution:
 # same precedence is mirrored here for the families whose installed SDK wires
 # it up (Bedrock, Anthropic, Google).
 GATEWAY_ENDPOINT_ENVIRONMENT_VARIABLE = "LANGSMITH_GATEWAY"
+_GATEWAY_CREDENTIAL_ENVIRONMENT_VARIABLE = "LANGSMITH_GATEWAY_API_KEY"
+_LANGSMITH_CREDENTIAL_ENVIRONMENT_VARIABLE = "LANGSMITH_API_KEY"
 _GATEWAY_DEFAULT_BASE_URL = "https://gateway.smith.langchain.com"
 _GATEWAY_TRUE_VALUES = ("true", "1", "yes")
 _GATEWAY_FALSE_VALUES = ("false", "0", "no")
+
+
+@dataclass(frozen=True)
+class GatewayRouting:
+    """Endpoint and credential presence after LangSmith gateway precedence."""
+
+    endpoint: ResolvedRoutingValue | None
+    credential: CredentialPresence
+    from_gateway: bool
 
 
 def first_environment_entry(
@@ -120,3 +131,80 @@ def gateway_endpoint_url(
         else raw.rstrip("/")
     )
     return f"{base}/{provider_path}"
+
+
+def resolve_gateway_routing(
+    environment: Mapping[str, str],
+    *,
+    provider_path: str,
+    credential_kind: str,
+    explicit_endpoint: str | None = None,
+    explicit_credential: str | None = None,
+    endpoint_environment_variables: Sequence[str] = (),
+    credential_environment_variables: Sequence[str] = (),
+    default_endpoint: str | None = None,
+) -> GatewayRouting:
+    """Resolve an endpoint and credential source the way the installed SDK does.
+
+    Endpoint precedence is explicit value, then the provider's own environment
+    names, then the gateway, then the SDK default.  The credential follows the
+    SDK's provenance flip: the gateway key wins only when the endpoint itself
+    came from the gateway, otherwise the provider key does.
+    """
+    gateway_url = gateway_endpoint_url(environment, provider_path)
+
+    from_gateway = False
+    endpoint: ResolvedRoutingValue | None
+    provider_endpoint = first_environment_entry(
+        environment, endpoint_environment_variables
+    )
+    if explicit_endpoint:
+        endpoint = ResolvedRoutingValue(explicit_endpoint, "explicit")
+    elif provider_endpoint is not None:
+        endpoint = ResolvedRoutingValue(
+            provider_endpoint[1], "environment", provider_endpoint[0]
+        )
+    elif gateway_url is not None:
+        endpoint = ResolvedRoutingValue(
+            gateway_url, "gateway", GATEWAY_ENDPOINT_ENVIRONMENT_VARIABLE
+        )
+        from_gateway = True
+    elif default_endpoint:
+        endpoint = ResolvedRoutingValue(default_endpoint, "sdk_default")
+    else:
+        endpoint = None
+
+    if explicit_credential:
+        return GatewayRouting(
+            endpoint, CredentialPresence(True, credential_kind, "explicit"), from_gateway
+        )
+
+    gateway_credential = None
+    if gateway_url is not None:
+        gateway_credential = first_environment_entry(
+            environment, (_GATEWAY_CREDENTIAL_ENVIRONMENT_VARIABLE,)
+        )
+    if gateway_credential is None and from_gateway:
+        gateway_credential = first_environment_entry(
+            environment, (_LANGSMITH_CREDENTIAL_ENVIRONMENT_VARIABLE,)
+        )
+    provider_credential = first_environment_entry(
+        environment, credential_environment_variables
+    )
+    chosen = (
+        (gateway_credential or provider_credential)
+        if from_gateway
+        else (provider_credential or gateway_credential)
+    )
+    if chosen is None:
+        credential = CredentialPresence(
+            False,
+            credential_kind,
+            "missing",
+            credential_environment_variables[0]
+            if credential_environment_variables
+            else None,
+        )
+    else:
+        credential = CredentialPresence(True, credential_kind, "environment", chosen[0])
+    return GatewayRouting(endpoint, credential, from_gateway)
