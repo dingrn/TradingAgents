@@ -1,4 +1,6 @@
 import os
+from collections.abc import Mapping
+from copy import deepcopy
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 
@@ -33,6 +35,13 @@ _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
 
 
+RESEARCH_DEPTHS = {
+    "Shallow": 1,
+    "Medium": 3,
+    "Deep": 5,
+}
+
+
 def _coerce(value: str, reference):
     """Coerce env-var string to the type of the existing default value.
 
@@ -56,10 +65,14 @@ def _coerce(value: str, reference):
     return value
 
 
-def _apply_env_overrides(config: dict) -> dict:
+def _apply_env_overrides(
+    config: dict,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
     """Apply TRADINGAGENTS_* env vars to the config dict in-place."""
+    environment = os.environ if environment is None else environment
     for env_var, key in _ENV_OVERRIDES.items():
-        raw = os.environ.get(env_var)
+        raw = environment.get(env_var)
         if raw is None or raw == "":
             continue
         try:
@@ -69,11 +82,11 @@ def _apply_env_overrides(config: dict) -> dict:
     return config
 
 
-DEFAULT_CONFIG = _apply_env_overrides({
+_BASE_CONFIG = {
     "project_dir": os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
-    "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "logs")),
-    "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR", os.path.join(_TRADINGAGENTS_HOME, "cache")),
-    "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH", os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")),
+    "results_dir": os.path.join(_TRADINGAGENTS_HOME, "logs"),
+    "data_cache_dir": os.path.join(_TRADINGAGENTS_HOME, "cache"),
+    "memory_log_path": os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
     # Optional cap on the number of resolved memory log entries. When set,
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.
@@ -170,4 +183,30 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)
         "":     "SPY",         # default for US-listed tickers (no suffix)
     },
-})
+}
+
+
+def resolve_default_config(
+    environment: Mapping[str, str] | None = None,
+) -> dict:
+    """Return fresh research defaults resolved against ``environment``.
+
+    Passing an explicit mapping makes resolution independent of process-global
+    environment state and import timing. When omitted, the current process
+    environment is used for backward compatibility with ``DEFAULT_CONFIG``.
+    """
+    environment = os.environ if environment is None else environment
+    config = deepcopy(_BASE_CONFIG)
+    config["results_dir"] = environment.get(
+        "TRADINGAGENTS_RESULTS_DIR", config["results_dir"]
+    )
+    config["data_cache_dir"] = environment.get(
+        "TRADINGAGENTS_CACHE_DIR", config["data_cache_dir"]
+    )
+    config["memory_log_path"] = environment.get(
+        "TRADINGAGENTS_MEMORY_LOG_PATH", config["memory_log_path"]
+    )
+    return _apply_env_overrides(config, environment)
+
+
+DEFAULT_CONFIG = resolve_default_config()

@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 
 import cli.main as m
+from tradingagents.default_config import RESEARCH_DEPTHS
 
 # Minimal selections dict shaped like get_user_selections()'s return value.
 SELECTIONS = {
@@ -31,6 +32,10 @@ def test_research_depth_sets_both_rounds_without_env(monkeypatch):
     cfg = m._build_run_config(SELECTIONS, checkpoint=None)
     assert cfg["max_debate_rounds"] == 5
     assert cfg["max_risk_discuss_rounds"] == 5
+
+
+def test_shared_research_depths_keep_cli_round_counts():
+    assert RESEARCH_DEPTHS == {"Shallow": 1, "Medium": 3, "Deep": 5}
 
 
 def test_env_round_counts_win_over_selection(monkeypatch):

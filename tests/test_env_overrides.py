@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 
@@ -127,3 +128,51 @@ def test_unknown_env_var_is_ignored(monkeypatch):
         TRADINGAGENTS_NONEXISTENT_KEY="oops",
     )
     assert "nonexistent_key" not in dc.DEFAULT_CONFIG
+
+
+def test_explicit_environment_resolves_fresh_defaults_without_mutating_process_env(monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_LLM_PROVIDER", "process-provider")
+    process_environment = os.environ.copy()
+    explicit_environment = {
+        "TRADINGAGENTS_LLM_PROVIDER": "google",
+        "TRADINGAGENTS_MAX_DEBATE_ROUNDS": "3",
+        "TRADINGAGENTS_RESULTS_DIR": "explicit-results",
+        "TRADINGAGENTS_CACHE_DIR": "explicit-cache",
+        "TRADINGAGENTS_MEMORY_LOG_PATH": "explicit-memory.md",
+    }
+
+    resolved = default_config_module.resolve_default_config(explicit_environment)
+
+    assert resolved["llm_provider"] == "google"
+    assert resolved["max_debate_rounds"] == 3
+    assert resolved["results_dir"] == "explicit-results"
+    assert resolved["data_cache_dir"] == "explicit-cache"
+    assert resolved["memory_log_path"] == "explicit-memory.md"
+    assert os.environ == process_environment
+
+
+def test_resolved_defaults_do_not_share_nested_mutable_values():
+    first = default_config_module.resolve_default_config({})
+    second = default_config_module.resolve_default_config({})
+
+    first["data_vendors"]["core_stock_apis"] = "alpha_vantage"
+    first["tool_vendors"]["get_stock_data"] = "alpha_vantage"
+    first["global_news_queries"].append("extra query")
+    first["benchmark_map"][""] = "QQQ"
+
+    assert second["data_vendors"]["core_stock_apis"] == "yfinance"
+    assert "get_stock_data" not in second["tool_vendors"]
+    assert "extra query" not in second["global_news_queries"]
+    assert second["benchmark_map"][""] == "SPY"
+
+
+def test_explicit_environment_is_resolved_after_module_import(monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_MAX_RISK_ROUNDS", "2")
+    imported_default = default_config_module.DEFAULT_CONFIG["max_risk_discuss_rounds"]
+
+    resolved = default_config_module.resolve_default_config(
+        {"TRADINGAGENTS_MAX_RISK_ROUNDS": "5"}
+    )
+
+    assert resolved["max_risk_discuss_rounds"] == 5
+    assert default_config_module.DEFAULT_CONFIG["max_risk_discuss_rounds"] == imported_default

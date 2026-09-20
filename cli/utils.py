@@ -6,6 +6,7 @@ from dotenv import find_dotenv, set_key
 from rich.console import Console
 
 from cli.models import AnalystType, AssetType
+from tradingagents.default_config import RESEARCH_DEPTHS
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
 
@@ -175,19 +176,22 @@ def select_analysts(asset_type: AssetType = AssetType.STOCK, default=None) -> li
 def select_research_depth(default=None) -> int:
     """Select research depth using an interactive selection."""
 
-    # Define research depth options with their corresponding values
-    DEPTH_OPTIONS = [
-        ("Shallow - Quick research, few debate and strategy discussion rounds", 1),
-        ("Medium - Middle ground, moderate debate rounds and strategy discussion", 3),
-        ("Deep - Comprehensive research, in depth debate and strategy discussion", 5),
+    depth_descriptions = {
+        "Shallow": "Quick research, few debate and strategy discussion rounds",
+        "Medium": "Middle ground, moderate debate rounds and strategy discussion",
+        "Deep": "Comprehensive research, in depth debate and strategy discussion",
+    }
+    depth_options = [
+        (f"{label} - {depth_descriptions[label]}", rounds)
+        for label, rounds in RESEARCH_DEPTHS.items()
     ]
 
     choice = questionary.select(
         "Select Your [Research Depth]:",
         choices=[
-            questionary.Choice(display, value=value) for display, value in DEPTH_OPTIONS
+            questionary.Choice(display, value=value) for display, value in depth_options
         ],
-        default=_matching_choice(DEPTH_OPTIONS, default),
+        default=_matching_choice(depth_options, default),
         instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
         style=questionary.Style(
             [
