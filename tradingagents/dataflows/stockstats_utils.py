@@ -193,6 +193,12 @@ def _cache_is_fresh(data_file, curr_date_dt, now) -> bool:
     return curr_date_dt.date() < now.date() or (now - written).total_seconds() <= OHLCV_CACHE_TTL_SECONDS
 
 
+def _in_range_ohlcv(data: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Normalize and order bars before inspecting the latest requested session."""
+    data = _clean_dataframe(data)
+    return data[data["Date"] <= cutoff].sort_values("Date")
+
+
 def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -232,6 +238,7 @@ def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFr
     # transient rate limit). Treat an empty/columnless cache as a miss and
     # re-fetch rather than serving the poisoned file forever.
     data = None
+    downloaded = None
     if os.path.exists(data_file):
         cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
         if (
@@ -239,7 +246,11 @@ def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFr
             and "Close" in cached.columns
             and _cache_is_fresh(data_file, curr_date_dt, now)
         ):
-            data = cached
+            candidate = _in_range_ohlcv(cached, curr_date_dt)
+            # An incomplete cache is not immutable historical data. Refetch
+            # once even within the TTL; never substitute the previous close.
+            if not candidate.empty and pd.notna(candidate["Close"].iloc[-1]):
+                data = candidate
 
     if data is None:
         downloaded = yf_retry(lambda: yf.download(
@@ -254,29 +265,24 @@ def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFr
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
             raise_for_empty(symbol, canonical, "price rows")
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
-        data = downloaded
+        data = _in_range_ohlcv(downloaded.copy(), curr_date_dt)
 
-    data = _clean_dataframe(data)
-
-    # Filter to curr_date to prevent look-ahead bias in backtesting.
-    data = data[data["Date"] <= curr_date_dt]
-
-    # A closeless newest bar is an unsettled session, not a symbol without data.
-    # _fill_price_gaps below drops it, here and mid-series alike, so the frame
-    # ends at the last settled bar; only a range with no close anywhere is no
-    # data (#1201, #1289).
+    # Keep this fork's strict latest-bar policy: an unsettled newest session
+    # must not silently become the previous session's close. The snapshot tool
+    # reports this as a verification gap, not an invalid or delisted ticker.
     if not data.empty and pd.isna(data["Close"].iloc[-1]):
-        settled = data["Close"].notna().to_numpy().nonzero()[0]
-        if settled.size == 0:
+        if not data["Close"].notna().any():
             raise NoMarketDataError(
                 symbol, canonical, "no bar in range has a closing price"
             )
-        logger.warning(
-            "%s: %d trailing bar(s) through %s have no closing price; using %s "
-            "as the latest close.", canonical, len(data) - settled[-1] - 1,
-            data["Date"].iloc[-1].date(), data["Date"].iloc[settled[-1]].date(),
+        raise NoMarketDataError(
+            symbol, canonical,
+            f"latest in-range OHLCV bar has no closing price "
+            f"({data['Date'].iloc[-1].date()}; requested {curr_date})"
         )
+
+    if data.empty:
+        raise NoMarketDataError(symbol, canonical, f"no OHLCV rows on or before {curr_date}")
 
     # Indicators need a continuous series, so gaps are carried forward. A caller
     # that reports the numbers themselves asks for the frame as it was reported:
@@ -286,6 +292,10 @@ def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFr
     # Reject a stale frame (latest row far older than curr_date) rather than
     # feeding year-old prices into indicators (#1021).
     _assert_ohlcv_not_stale(data, curr_date, symbol, canonical)
+
+    # Persist a download only after it passes the requested-date checks.
+    if downloaded is not None:
+        downloaded.to_csv(data_file, index=False, encoding="utf-8")
 
     return data
 

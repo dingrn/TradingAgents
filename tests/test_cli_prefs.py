@@ -96,6 +96,19 @@ def test_a_region_specific_provider_survives():
 
 # --- wiring ------------------------------------------------------------------
 
+@pytest.fixture
+def _interactive_cli(monkeypatch):
+    import cli.main as m
+    from tradingagents.default_config import _ENV_OVERRIDES
+
+    # Import first so a local .env cannot reload overrides after we clear them.
+    for env_var in _ENV_OVERRIDES:
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setitem(m.DEFAULT_CONFIG, "backend_url", None)
+    monkeypatch.setattr(m, "ensure_api_key", lambda provider: None)
+    return m
+
+
 def _answer_every_prompt(monkeypatch):
     """Drive the real selection flow, answering each prompt with a fixed value."""
     import cli.main as m
@@ -115,7 +128,7 @@ def _answer_every_prompt(monkeypatch):
 
 
 @pytest.mark.unit
-def test_selections_are_remembered_after_a_run(monkeypatch):
+def test_selections_are_remembered_after_a_run(monkeypatch, _interactive_cli):
     """Drives the real flow: a stubbed selections dict would hide a key mismatch."""
     m = _answer_every_prompt(monkeypatch)
 
@@ -144,7 +157,7 @@ def test_a_custom_language_is_remembered_without_breaking_the_next_run():
 
 
 @pytest.mark.unit
-def test_a_remembered_endpoint_is_offered_back(monkeypatch):
+def test_a_remembered_endpoint_is_offered_back(monkeypatch, _interactive_cli):
     """Users of a local or custom endpoint retyped the URL every run: it was
     remembered and validated, then never read."""
     import cli.main as m

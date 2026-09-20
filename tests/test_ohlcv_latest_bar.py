@@ -3,13 +3,10 @@
 yfinance can return the newest in-range bar with a NaN close (an unsettled or
 glitched session). The old path parsed dates without normalizing timezone and
 dropped every NaN-close row before applying the curr_date cutoff, so the latest
-bar disappeared and the previous trading day looked like the latest. Now dates
-are normalized before the cutoff, so the frame ends at the last settled bar
-instead of carrying a fabricated close.
-
-Refusing the whole frame instead (the first attempt at #1201) reported a
-tradable symbol as invalid or delisted (#1289), so only a range with no close
-anywhere counts as no data and the staleness check judges the rest.
+bar disappeared and the previous trading day looked like the latest. This fork
+normalizes dates before the cutoff, retries incomplete cached data once, and
+rejects a still-incomplete latest bar. The snapshot tool reports the resulting
+verification gap without calling the ticker invalid or fabricating prices.
 """
 from __future__ import annotations
 
@@ -86,33 +83,65 @@ def test_fill_price_gaps_drops_nan_close_rows():
 
 # --- load_ohlcv end-to-end (with a mocked cache read) -----------------------
 
-def _run_load(monkeypatch, tmp_path, frame, curr_date):
+def _run_load(monkeypatch, tmp_path, frame, curr_date, refreshed=None):
     """Drive load_ohlcv against a pre-seeded cache frame (no network)."""
     monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
     today = pd.Timestamp(curr_date)
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: today))
     cache_file = tmp_path / "AAPL-YFin-data.csv"
     cache_file.write_text(frame.to_csv(index=False))
-    os.utime(cache_file, (today.timestamp(), today.timestamp()))
+    written_at = today.to_pydatetime().timestamp()
+    os.utime(cache_file, (written_at, written_at))
 
     def _fail_download(*a, **k):
+        if refreshed is not None:
+            return refreshed.set_index("Date")
         raise AssertionError("should use the seeded cache, not download")
     monkeypatch.setattr(su.yf, "download", _fail_download)
     return su.load_ohlcv("AAPL", curr_date)
 
 
 @pytest.mark.unit
-def test_unsettled_latest_bar_is_served_as_the_last_settled_bar(monkeypatch, tmp_path):
-    # Newest bar (the curr_date) has no close: serve the last settled bar rather
-    # than reporting the whole symbol as unavailable (#1289).
+def test_latest_in_range_nan_close_raises_not_silent_fallback(monkeypatch, tmp_path):
+    # Even after a refresh, the newest bar must not silently become yesterday's.
     frame = pd.DataFrame({
         "Date": ["2026-05-07", "2026-05-08"],
         "Open": [100.0, 101.0], "High": [101.0, 102.0], "Low": [99.0, 100.0],
         "Close": [100.5, float("nan")], "Volume": [1_000_000, 1_000_000],
     })
+    with pytest.raises(NoMarketDataError, match="no closing price"):
+        _run_load(monkeypatch, tmp_path, frame, "2026-05-08", refreshed=frame)
+
+
+@pytest.mark.unit
+def test_incomplete_cache_refetches_and_persists_recovered_close(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Date": ["2026-05-07", "2026-05-08"],
+                          "Close": [100.5, float("nan")]})
+    refreshed = frame.copy()
+    refreshed.loc[1, "Close"] = 102.5
+    out = _run_load(monkeypatch, tmp_path, frame, "2026-05-08", refreshed=refreshed)
+    assert out["Close"].iloc[-1] == 102.5
+    assert pd.read_csv(next(tmp_path.glob("*.csv")))["Close"].iloc[-1] == 102.5
+
+
+@pytest.mark.unit
+def test_missing_future_close_does_not_invalidate_historical_cache(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"Date": ["2026-05-08", "2026-05-09"],
+                          "Close": [100.5, float("nan")]})
     out = _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
-    assert out["Date"].iloc[-1] == pd.Timestamp("2026-05-07")
+    assert out["Date"].iloc[-1] == pd.Timestamp("2026-05-08")
     assert out["Close"].iloc[-1] == 100.5
+
+
+@pytest.mark.unit
+def test_incomplete_download_is_not_cached(monkeypatch, tmp_path):
+    monkeypatch.setattr(su, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    frame = pd.DataFrame({"Date": pd.to_datetime(["2026-05-07", "2026-05-08"]),
+                          "Close": [100.5, float("nan")]})
+    monkeypatch.setattr(su.yf, "download", lambda *a, **k: frame.set_index("Date"))
+    with pytest.raises(NoMarketDataError, match="2026-05-08"):
+        su.load_ohlcv("COHR", "2026-05-08")
+    assert not list(tmp_path.glob("*.csv"))
 
 
 @pytest.mark.unit
@@ -123,19 +152,18 @@ def test_no_settled_bar_at_all_is_still_no_data(monkeypatch, tmp_path):
         "Close": [float("nan"), float("nan")], "Volume": [1_000_000, 1_000_000],
     })
     with pytest.raises(NoMarketDataError, match="no bar in range has a closing price"):
-        _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
+        _run_load(monkeypatch, tmp_path, frame, "2026-05-08", refreshed=frame)
 
 
 @pytest.mark.unit
-def test_serving_the_last_settled_bar_does_not_bypass_the_staleness_check(
+def test_complete_bars_do_not_bypass_the_staleness_check(
     monkeypatch, tmp_path
 ):
-    # Falling back must not resurrect a long-dead series: once the closeless
-    # tail is gone, the remaining bar is judged on its age like any other.
+    # A complete closing price still cannot resurrect a long-dead series.
     frame = pd.DataFrame({
-        "Date": ["2026-01-05", "2026-05-08"],
+        "Date": ["2026-01-05", "2026-01-06"],
         "Open": [100.0, 101.0], "High": [101.0, 102.0], "Low": [99.0, 100.0],
-        "Close": [100.5, float("nan")], "Volume": [1_000_000, 1_000_000],
+        "Close": [100.5, 101.5], "Volume": [1_000_000, 1_000_000],
     })
     with pytest.raises(NoMarketDataError, match="stale"):
         _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
@@ -189,7 +217,8 @@ def test_the_snapshot_does_not_present_a_filled_price_as_reported(monkeypatch, t
     monkeypatch.setattr(su.pd.Timestamp, "today", staticmethod(lambda: today))
     cache = tmp_path / "AAPL-YFin-data.csv"
     cache.write_text(frame.to_csv(index=False))
-    os.utime(cache, (today.timestamp(), today.timestamp()))
+    written_at = today.to_pydatetime().timestamp()
+    os.utime(cache, (written_at, written_at))
     monkeypatch.setattr(su.yf, "download", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("should read the seeded cache")))
 
